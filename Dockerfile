@@ -5,7 +5,7 @@ ARG JOSE_COMMIT_SHA=54bdd6dcce839e6177f732d3d2c07854d988f860
 ARG TANG_COMMIT_SHA=2ef4acf9d4f2113c6b1789b64a7357af667a3efe
 
 
-RUN apk add --no-cache \
+RUN apk add --no-cache --update \
     bash \
     g++ gawk git gmp gzip \
     http-parser-dev \
@@ -64,7 +64,7 @@ COPY init-tangd.sh \
 
 
 RUN chmod +x /usr/local/bin/init-tangd \
- && apk add --no-cache \
+ && apk add --no-cache --update \
         bash \
         http-parser \
         jansson \
