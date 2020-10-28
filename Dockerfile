@@ -70,7 +70,6 @@ RUN chmod +x /usr/local/bin/init-tangd \
         jansson \
         openssl \
         socat \
-        wget \
         zlib
 
 
@@ -81,5 +80,5 @@ VOLUME [ "/home/user/db" ]
 CMD [ "init-tangd" ]
 
 
-HEALTHCHECK --start-period=1m --interval=120s --timeout=5s --retries=3 \
+HEALTHCHECK --start-period=5s --interval=30s --timeout=5s --retries=3 \
         CMD ["wget", "--tries", "5", "-qSO", "/dev/null",  "http://localhost:8080/adv"]
