@@ -1,6 +1,6 @@
 #!/bin/bash -e
 
-cd "${1:-/home/user}"
+cd "/data"
 
 mkdir -p db/tang cache/tang
 grep -r -q '"sign"' db/tang || tangd-keygen db/tang

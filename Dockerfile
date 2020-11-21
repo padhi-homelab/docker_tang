@@ -62,8 +62,12 @@ COPY --from=builder \
 COPY init-tangd.sh \
      /usr/local/bin/init-tangd
 
+COPY setup-volume.sh \
+     /etc/docker-entrypoint.d/setup-volume.sh
+
 
 RUN chmod +x /usr/local/bin/init-tangd \
+             /etc/docker-entrypoint.d/setup-volume.sh \
  && apk add --no-cache --update \
         bash \
         http-parser \
@@ -74,7 +78,7 @@ RUN chmod +x /usr/local/bin/init-tangd \
 
 
 EXPOSE 8080
-VOLUME [ "/home/user/db" ]
+VOLUME [ "/data" ]
 
 
 CMD [ "init-tangd" ]
