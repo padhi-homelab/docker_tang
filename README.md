@@ -26,3 +26,28 @@ _<More details to be added soon>_
 
 [Alpine Linux]: https://alpinelinux.org/
 [tang]:         https://github.com/latchset/tang
+
+
+# Quick-start
+To start a one-shot container simply run
+`docker run -it --rm -p 8080:8080/tcp padhihomelab/tang`
+where the standard server port, `8080`, will be exposed on your host machine.
+
+## Persist data
+The "quick-start command" will not persist its data (located at `/data`) beyond the lifetime of the container.  
+To link the tang server's data with a persistent volume on the host run:  
+`docker run -it --rm -p 8080:8080 --volume "/home/myUser/whatever":"/data" padhihomelab/tang`  
+or if you want to work with docker volumes:  
+``` sh
+#!/bin/sh
+data_volume=$(docker volume create)
+docker run -it --rm -p 8080:8080 --volume "$data_volume":"/data" padhihomelab/tang
+```
+
+## Change port
+To expose tang on a different port on your host machine, e.g. 1234, change the `-p` parameter:
+`-p 1234:8080`
+
+## Run in the background
+Simply add the `--detach` flag:
+`docker run -it --rm -p 8080:8080 --volume "/wherever/on/host":"/data" --detach padhihomelab/tang`
