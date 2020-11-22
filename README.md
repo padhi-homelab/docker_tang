@@ -4,18 +4,10 @@
 
 A multiarch [tang] Docker image, based on [Alpine Linux].
 
-<table>
-  <thead>
-    <tr>
-      <th>:heavy_check_mark: i386</th>
-      <th>:heavy_check_mark: amd64</th>
-      <th>:heavy_check_mark: arm</th>
-      <th>:heavy_check_mark: armhf</th>
-      <th>:heavy_check_mark: aarch64</th>
-      <th>:heavy_check_mark: ppc64le</th>
-    <tr>
-  </thead>
-</table>
+|        386         |       amd64        |       arm/v6       |       arm/v7       |       arm64        |      ppc64le       |       s390x        |
+| :----------------: | :----------------: | :----------------: | :----------------: | :----------------: | :----------------: | :----------------: |
+| :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: |
+
 
 
 
