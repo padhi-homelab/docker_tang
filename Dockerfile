@@ -78,7 +78,7 @@ RUN chmod +x /usr/local/bin/init-tangd \
 
 
 EXPOSE 8080
-VOLUME [ "/data" ]
+VOLUME [ "/data/db" ]
 
 
 CMD [ "init-tangd" ]
