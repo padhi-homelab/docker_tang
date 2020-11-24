@@ -1,0 +1,1743 @@
+From a0aa280cfe7a756bc9f965129c847dc9bfd2e84d Mon Sep 17 00:00:00 2001
+From: Sergio Correia <scorreia@redhat.com>
+Date: Sun, 29 Sep 2019 10:05:05 -0300
+Subject: [PATCH] Move key generation to tang
+
+Until now, tang has relied the following two scripts to handle keys:
+- tangd-keygen, which generates the keys in a specific JWK dir
+- tangd-update, which reads the directory with the keys and updates a
+  cache directory with files that will be used by tang during its
+  operation
+
+We also rely on systemd to watch the JWK dir and automatically run
+tangd-update when it is modified, so that the cache directory would be
+kept in a consistent state with regard to the available keys.
+
+However, this has shown to be unreliable and to cause issues in some
+situations. For instance, in #23 we see that sometimes the keys are not
+ready when tang starts operating, and in #24 we see that we have issues
+if somehow the cache directory is removed while tang is running.
+
+To improve reliability, the handling of keys is now being moved to tang
+itself. In this commit we implement routines to perform the operations
+that the aforementioned scripts did; tang can now create keys and also
+read them directly to perform its required operations.
+
+Changes after this commit:
+1) there is no cache directory anymore; tang will read the keys directly
+   from JWK dir instead of reading files from the cache directory
+2) as a consequence of 1), we now pass JWK dir as the argument to tang
+3) tangd-update is gone, since there is no need for a cache directory
+4) when reading JWK dir, tang will create keys if there are none -- this
+   was already the case on startup  before this commit, but now we do not
+   rely on systemd units to do this any longer
+5) many of the previously used systemd units are not required anymore
+
+Resolves #23
+Resolves #24
+---
+ Makefile.am                   |   11 +-
+ src/keys.c                    | 1043 +++++++++++++++++++++++++++++++++
+ src/keys.h                    |   84 +++
+ src/tangd-update              |   83 ---
+ src/tangd.c                   |   60 +-
+ src/util.c                    |  141 +++++
+ src/util.h                    |   33 ++
+ tests/adv                     |    4 +-
+ tests/rec                     |    4 +-
+ units/tangd-keygen.service.in |    8 -
+ units/tangd-update.path.in    |    4 -
+ units/tangd-update.service.in |    6 -
+ units/tangd.socket.in         |    5 -
+ units/tangd@.service.in       |    2 +-
+ 14 files changed, 1342 insertions(+), 146 deletions(-)
+ create mode 100644 src/keys.c
+ create mode 100644 src/keys.h
+ delete mode 100755 src/tangd-update
+ create mode 100644 src/util.c
+ create mode 100644 src/util.h
+ delete mode 100644 units/tangd-keygen.service.in
+ delete mode 100644 units/tangd-update.path.in
+ delete mode 100644 units/tangd-update.service.in
+
+diff --git a/Makefile.am b/Makefile.am
+index af30d2f..f855dcd 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -7,17 +7,13 @@ man8_MANS=
+ AM_CFLAGS = @TANG_CFLAGS@ @jose_CFLAGS@
+ LDADD = @jose_LIBS@ @http_parser_LIBS@
+ 
+-cachedir = $(localstatedir)/cache/$(PACKAGE_NAME)
+ jwkdir = $(localstatedir)/db/$(PACKAGE_NAME)
+ 
+ nodist_systemdsystemunit_DATA = \
+     units/tangd@.service \
+-    units/tangd.socket \
+-    units/tangd-update.path \
+-    units/tangd-update.service \
+-    units/tangd-keygen.service
++    units/tangd.socket
+ 
+-dist_libexec_SCRIPTS = src/tangd-update src/tangd-keygen
++dist_libexec_SCRIPTS = src/tangd-keygen
+ dist_bin_SCRIPTS = src/tang-show-keys
+ libexec_PROGRAMS = src/tangd
+ 
+@@ -39,14 +35,13 @@ man1_MANS += doc/tang-show-keys.1
+ man8_MANS += doc/tang.8
+ endif
+ 
+-src_tangd_SOURCES = src/http.c src/http.h src/tangd.c
++src_tangd_SOURCES = src/util.c src/util.h src/keys.c src/keys.h src/http.c src/http.h src/tangd.c
+ 
+ %: %.in
+ 	$(AM_V_GEN)mkdir -p "`dirname "$@"`"
+ 	$(AM_V_GEN)$(SED) \
+ 		-e 's,@libexecdir\@,$(libexecdir),g' \
+ 		-e 's,@jwkdir\@,$(jwkdir),g' \
+-		-e 's,@cachedir\@,$(cachedir),g' \
+ 		$(srcdir)/$@.in > $@
+ 
+ AM_TESTS_ENVIRONMENT = SD_ACTIVATE="@SD_ACTIVATE@" PATH=$(srcdir)/src:$(builddir)/src:$(PATH)
+diff --git a/src/keys.c b/src/keys.c
+new file mode 100644
+index 0000000..77f5d3c
+--- /dev/null
++++ b/src/keys.c
+@@ -0,0 +1,1043 @@
++/* vim: set tabstop=8 shiftwidth=4 softtabstop=4 expandtab smarttab colorcolumn=80: */
++/*
++ * Copyright (c) 2019 Red Hat, Inc.
++ * Author: Sergio Correia <scorreia@redhat.com>
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <jose/b64.h>
++#include <jose/jwk.h>
++#include <jose/jws.h>
++#include <jose/io.h>
++#include <jansson.h>
++#include <string.h>
++
++#include "util.h"
++#include "keys.h"
++
++#ifndef PATH_MAX
++#define PATH_MAX 4096
++#endif
++
++#define TANG_MAXBUFLEN (1024 * 1024)
++
++#define DEFAULT_HASH_ALG "S1"
++
++/* TODO: check if jose has a way to export the hash algorithms it supports. */
++const char *hash_alg[] = {"S1", "S224", "S256", "S384", "S512", NULL};
++
++size_t
++hash_alg_size(void)
++{
++    size_t count = 0;
++    for (size_t i = 0; hash_alg[i]; i++) {
++        count++;
++    }
++    return count;
++}
++
++int
++is_hash(const char *alg)
++{
++    for (size_t a = 0, size = hash_alg_size(); a < size; a++) {
++        if (strcmp(alg, hash_alg[a]) == 0) {
++            return 1;
++        }
++    }
++    return 0;
++}
++
++/*
++ * Generates a JWK and returns a json_t*, which must be released with
++ * json_decref().
++ */
++static json_t*
++jwk_generate(const char* alg)
++{
++    json_t *jalg = json_pack("{s:s}", "alg", alg);
++    if (!jalg) {
++        fprintf(stderr, "Error packing JSON with alg %s\n", alg);
++        return NULL;
++    }
++
++    if (!jose_jwk_gen(NULL, jalg)) {
++        fprintf(stderr, "Error generating JWK with alg %s\n", alg);
++        json_decref(jalg);
++        return NULL;
++    }
++
++    return jalg;
++}
++
++/*
++ * Returns a thumbprint from a JWK and a given algorithm, which must be
++ * released with free().
++ */
++char*
++jwk_thumbprint(const json_t* jwk, const char* alg)
++{
++    size_t elen = 0;
++    size_t dlen = 0;
++
++    const char* hash = alg;
++    if (!is_hash(alg)) {
++        hash = DEFAULT_HASH_ALG;
++    }
++
++    dlen = jose_jwk_thp_buf(NULL, NULL, hash, NULL, 0);
++    if (dlen == SIZE_MAX) {
++        fprintf(stderr, "Error determining hash size for %s\n", hash);
++        return NULL;
++    }
++
++    elen = jose_b64_enc_buf(NULL, dlen, NULL, 0);
++    if (elen == SIZE_MAX) {
++        fprintf(stderr, "Error determining encoded size for %s\n", hash);
++        return NULL;
++    }
++
++    uint8_t dec[dlen];
++    char enc[elen];
++
++    if (!jose_jwk_thp_buf(NULL, jwk, hash, dec, sizeof(dec))) {
++        fprintf(stderr, "Error making thumbprint\n");
++        return NULL;
++    }
++
++    if (jose_b64_enc_buf(dec, dlen, enc, sizeof(enc)) != elen) {
++        fprintf(stderr, "Error encoding data Base64\n");
++        return NULL;
++    }
++
++    char *thp = malloc(elen + 1);
++    if (!thp) {
++        fprintf(stderr, "Error allocating string for thumbprint\n");
++        return NULL;
++    }
++
++    if (!strncpy(thp, enc, elen)) {
++        fprintf(stderr, "Error copying thumbprint to string\n");
++        free(thp);
++        return NULL;
++    }
++
++    thp[elen] = '\0';
++    return thp;
++}
++
++char*
++jwk_thumbprint_from_file(const char *file, const char *alg)
++{
++    json_auto_t *jwk = json_load_file(file, 0, NULL);
++    if (!jwk) {
++        return 0;
++    }
++    return jwk_thumbprint(jwk, alg);
++}
++
++/*
++ * Releases the allocated memory by struct tang_jwk*.
++ */
++void
++free_tang_jwk(struct tang_jwk* tjwk)
++{
++    if (!tjwk) {
++        return;
++    }
++
++    if (tjwk->m_json) {
++        json_decref(tjwk->m_json);
++    }
++    free(tjwk->m_from_file);
++    free(tjwk->m_thp);
++    free(tjwk->m_alg);
++    free(tjwk->m_str);
++    free(tjwk);
++}
++
++void
++cleanup_tang_jwk(struct tang_jwk **jwk)
++{
++    if (!jwk || !*jwk) {
++        return;
++    }
++    free_tang_jwk(*jwk);
++}
++
++struct tang_jwk*
++new_tang_jwk_from_args(json_t *jwk, const char* thp, const char* alg)
++{
++    if (!jwk) {
++        fprintf(stderr, "Invalid JWK (%p) \n", jwk);
++        return NULL;
++    }
++
++    struct tang_jwk *tjwk = calloc(1, sizeof(*tjwk));
++    if (!tjwk) {
++        fprintf(stderr, "Error allocating new struct tang_jwk.\n");
++        return NULL;
++    }
++
++    tjwk->m_json = json_incref(jwk);
++    tjwk->m_from_file = NULL;
++
++    if (alg) {
++        tjwk->m_alg = strdup(alg);
++        if (!tjwk->m_alg) {
++            fprintf(stderr, "Unable to copy algorithm (%s) to tang_jwk.\n", alg);
++            free_tang_jwk(tjwk);
++            return NULL;
++        }
++    }
++
++    if (thp) {
++        tjwk->m_thp = strdup(thp);
++        if (!tjwk->m_thp) {
++            fprintf(stderr, "Unable to copy thumbprint (%s).\n", thp);
++            free_tang_jwk(tjwk);
++            return NULL;
++        }
++    }
++
++    tjwk->m_str = json_dumps(tjwk->m_json, JSON_SORT_KEYS | JSON_COMPACT);
++    if (!tjwk->m_str) {
++        fprintf(stderr, "Unable to get string version from JWK.\n");
++        free_tang_jwk(tjwk);
++        return NULL;
++    }
++
++    return tjwk;
++}
++
++struct tang_jwk*
++tang_jwk_dup(const struct tang_jwk *jwk)
++{
++    if (!jwk) {
++        return NULL;
++    }
++
++    struct tang_jwk *new_jwk = new_tang_jwk_from_args(jwk->m_json, jwk->m_thp, jwk->m_alg);
++    if (!new_jwk) {
++        return NULL;
++    }
++
++    if (jwk->m_from_file) {
++        new_jwk->m_from_file = strdup(jwk->m_from_file);
++        if (!new_jwk->m_from_file) {
++            free_tang_jwk(new_jwk);
++            return NULL;
++        }
++    }
++
++    return new_jwk;
++}
++
++struct tang_jwk*
++new_tang_jwk(const char* file, const char* alg)
++{
++    if (!file || !alg) {
++        fprintf(stderr, "Invalid file (%s) or algorithm (%s).\n", file, alg);
++        return NULL;
++    }
++
++    json_auto_t *jwk = json_load_file(file, 0, NULL);
++    if (!jwk) {
++        fprintf(stderr, "Unable to parse JSON from %s.\n", file);
++        return NULL;
++    }
++
++    struct tang_jwk *tjwk = calloc(1, sizeof(*tjwk));
++    if (!tjwk) {
++        fprintf(stderr, "Error allocating new struct tang_jwk.\n");
++        return NULL;
++    }
++
++    tjwk->m_json = json_incref(jwk);
++    tjwk->m_from_file = strdup(file);
++    if (!tjwk->m_from_file) {
++        fprintf(stderr, "Unable to copy file name (%s) to m_from_file.\n", file);
++        free_tang_jwk(tjwk);
++        return NULL;
++    }
++    tjwk->m_alg = strdup(alg);
++    if (!tjwk->m_alg) {
++        fprintf(stderr, "Unable to copy algorithm (%s) to tang_jwk.\n", alg);
++        free_tang_jwk(tjwk);
++        return NULL;
++    }
++
++    tjwk->m_thp = jwk_thumbprint(tjwk->m_json, tjwk->m_alg);
++    if (!tjwk->m_thp) {
++        fprintf(stderr, "Unable to get thumbprint using alg (%s).\n", alg);
++        free_tang_jwk(tjwk);
++        return NULL;
++    }
++
++    tjwk->m_str = json_dumps(tjwk->m_json, JSON_SORT_KEYS | JSON_COMPACT);
++    if (!tjwk->m_str) {
++        fprintf(stderr, "Unable to get string version from JWK.\n");
++        free_tang_jwk(tjwk);
++        return NULL;
++    }
++
++    return tjwk;
++}
++
++/*
++ * Builds a new struct tang_jwk*, which should be destructed by calling
++ * free_tang_jwk().
++ */
++struct tang_jwk*
++generate_new_tang_jwk(const char* alg)
++{
++    if (!alg) {
++        fprintf(stderr, "Invalid algorithm.\n");
++        return NULL;
++    }
++
++    struct tang_jwk *tjwk = calloc(1, sizeof(*tjwk));
++    if (!tjwk) {
++        fprintf(stderr, "Error allocating new struct tang_jwk.\n");
++        return NULL;
++    }
++
++    tjwk->m_alg = strdup(alg);
++    if (!tjwk->m_alg) {
++        fprintf(stderr, "Unable to copy algorithm (%s) to tang_jwk.\n", alg);
++        free_tang_jwk(tjwk);
++        return NULL;
++    }
++
++    tjwk->m_json = jwk_generate(alg);
++    if (!tjwk->m_json) {
++        fprintf(stderr, "Unable to generate new JWK using alg (%s).\n", alg);
++        free_tang_jwk(tjwk);
++        return NULL;
++    }
++    tjwk->m_thp = jwk_thumbprint(tjwk->m_json, tjwk->m_alg);
++    if (!tjwk->m_thp) {
++        fprintf(stderr, "Unable to get thumbprint using alg (%s).\n", alg);
++        free_tang_jwk(tjwk);
++        return NULL;
++    }
++
++    tjwk->m_str = json_dumps(tjwk->m_json, JSON_SORT_KEYS | JSON_COMPACT);
++    if (!tjwk->m_str) {
++        fprintf(stderr, "Unable to get string version from JWK.\n");
++        free_tang_jwk(tjwk);
++        return NULL;
++    }
++    return tjwk;
++}
++
++static int
++file_valid_for(const char *file, const char *use)
++{
++    json_auto_t *jwk = json_load_file(file, 0, NULL);
++    if (!jwk) {
++        return 0;
++    }
++
++    return jose_jwk_prm(NULL, jwk, false, use);
++}
++
++static int
++jwk_valid_for(const json_t *jwk, const char *use)
++{
++    return jose_jwk_prm(NULL, jwk, false, use);
++}
++
++
++int valid_for_signing_and_verifying(const char *file)
++{
++    json_auto_t *jwk = json_load_file(file, 0, NULL);
++    if (!jwk) {
++        return 0;
++    }
++
++    const char *use[] = {"sign", "verify", NULL};
++    int ret = 1;
++    for (int i = 0; use[i] != NULL; i++) {
++        if (!jwk_valid_for(jwk, use[i])) {
++            ret = 0;
++            break;
++        }
++    }
++
++    return ret;
++}
++
++int valid_for_signing(const char *file)
++{
++    return file_valid_for(file, "sign");
++}
++
++int valid_for_deriving_keys(const char *file)
++{
++    return file_valid_for(file, "deriveKey");
++}
++
++struct tang_jwk_list*
++new_tang_jwk_list(void)
++{
++    struct tang_jwk_list *tjl = malloc(sizeof(*tjl));
++    if (!tjl) {
++        return NULL;
++    }
++    tjl->m_jwk = NULL;
++    tjl->m_size = 0;
++    return tjl;
++}
++
++void
++free_tang_jwk_list(struct tang_jwk_list *tjl)
++{
++    if (!tjl) {
++        return;
++    }
++
++    for (size_t i = 0, size = tjl->m_size; i < size; i++) {
++        free_tang_jwk(tjl->m_jwk[i]);
++    }
++    free(tjl->m_jwk);
++    free(tjl);
++}
++
++int
++tang_jwk_list_add(struct tang_jwk_list *tjl, struct tang_jwk *jwk_to_add)
++{
++    if (!tjl || !jwk_to_add) {
++        return 0;
++    }
++
++    struct tang_jwk *jwk = tang_jwk_dup(jwk_to_add);
++    if (!jwk) {
++        return 0;
++    }
++
++    struct tang_jwk **new_jwk = realloc(tjl->m_jwk, sizeof(struct tang_jwk*) * (tjl->m_size + 1));
++    if (!new_jwk) {
++        fprintf(stderr, "Error reallocating memory for the new JWK.\n");
++        free_tang_jwk(jwk);
++        return 0;
++    }
++
++    tjl->m_jwk = new_jwk;
++    tjl->m_jwk[tjl->m_size++] = jwk;
++    return 1;
++}
++
++static int
++tang_jwk_thp_bsearch_cmp_func(const void *a, const void *b)
++{
++    const char *key = (const char*)a;
++    const struct tang_jwk *jwk = *(const struct tang_jwk**)b;
++    return strcmp(key, jwk->m_thp);
++}
++
++struct tang_jwk*
++tang_jwk_list_find_thp(const struct tang_jwk_list *tjl, const char *thp)
++{
++    if (!tjl || !thp) {
++        return NULL;
++    }
++
++    if (tjl->m_size == 0) {
++        return NULL;
++    }
++
++    struct tang_jwk **item = bsearch(thp, tjl->m_jwk, tjl->m_size, sizeof(struct tang_jwk*), tang_jwk_thp_bsearch_cmp_func);
++    if (!item) {
++        return NULL;
++    }
++    return *item;
++}
++
++void
++free_tang_keys_info(struct tang_keys_info *tki)
++{
++    if (!tki) {
++        return;
++    }
++
++    free(tki->m_jwkdir);
++    free_file_list(tki->m_payload_keys);
++    free_file_list(tki->m_sign_keys);
++    free_tang_jwk_list(tki->m_derive);
++    free_tang_jwk_list(tki->m_adv);
++    free_tang_jwk(tki->m_default_adv);
++    free(tki);
++}
++
++struct tang_keys_info*
++new_tang_keys_info(const char* jwkdir)
++{
++    if (!jwkdir) {
++        fprintf(stderr, "Invalid JWK dir.\n");
++        return NULL;
++    }
++
++    struct tang_keys_info *tki = calloc(1, sizeof(struct tang_keys_info));
++    if (!tki) {
++        fprintf(stderr, "Error allocating tang_keys_info struct.\n");
++        return NULL;
++    }
++
++    tki->m_jwkdir = strdup(jwkdir);
++    if (!tki->m_jwkdir) {
++        fprintf(stderr, "Error copying JWK dir to tang_keys_info struct.\n");
++        free_tang_keys_info(tki);
++        return NULL;
++    }
++
++    tki->m_payload_keys = new_file_list();
++    if (!tki->m_payload_keys) {
++        fprintf(stderr, "Error allocating payload keys.\n");
++        free_tang_keys_info(tki);
++        return NULL;
++    }
++
++    tki->m_sign_keys = new_file_list();
++    if (!tki->m_sign_keys) {
++        fprintf(stderr, "Error allocating signing keys.\n");
++        free_tang_keys_info(tki);
++        return NULL;
++    }
++
++    tki->m_derive = new_tang_jwk_list();
++    if (!tki->m_derive) {
++        fprintf(stderr, "Error allocating list of deriving keys.\n");
++        free_tang_keys_info(tki);
++        return NULL;
++    }
++
++    tki->m_adv = new_tang_jwk_list();
++    if (!tki->m_adv) {
++        fprintf(stderr, "Error allocating list adv.\n");
++        free_tang_keys_info(tki);
++        return NULL;
++    }
++
++    tki->m_default_adv = NULL;
++
++    return tki;
++}
++
++int
++check_keys(const char* jwkdir)
++{
++    if (!jwkdir) {
++        return 0;
++    }
++
++    /* We ignore hidden files in here because we only care about
++     * advertised keys. */
++    struct file_list *fl __attribute__ ((__cleanup__(cleanup_file_list))) = list_files(jwkdir, ".jwk", 1 /* ignore hidden */);
++    if (!fl) {
++        return 0;
++    }
++
++    if (fl->m_size > 0) {
++        /* There are already keys in the JWKdir, so let's leave it as is. */
++        return 1;
++    }
++
++    /* At this point, there are no keys, so let's create them. */
++    const char *alg[] = {"ES512", "ECMR", NULL};
++    char path[PATH_MAX];
++    for (int i = 0; alg[i] != NULL; i++) {
++        struct tang_jwk *jwk __attribute__((cleanup(cleanup_tang_jwk))) = generate_new_tang_jwk(alg[i]);
++        if (!jwk) {
++            fprintf(stderr, "Error generating JWK using %s\n", alg[i]);
++            return 0;
++        }
++
++        snprintf(path, PATH_MAX, "%s/%s.jwk", jwkdir, jwk->m_thp);
++        path[sizeof(path) - 1] = '\0';
++
++        FILE *fp = fopen(path, "w+");
++        if (!fp) {
++            fprintf(stderr, "Error creating JWK file to %s\n", path);
++            return 0;
++        }
++        fprintf(fp, "%s", jwk->m_str);
++        fclose(fp);
++    }
++    return 1;
++}
++
++static int
++tang_jwk_thp_cmp_func(const void *a, const void *b)
++{
++    const struct tang_jwk *ta = *(const struct tang_jwk**)a;
++    const struct tang_jwk *tb = *(const struct tang_jwk**)b;
++    return strcmp(ta->m_thp, tb->m_thp);
++}
++
++void
++cleanup_tang_keys_info(struct tang_keys_info **tki)
++{
++    if (!tki || !*tki) {
++        return;
++    }
++    free_tang_keys_info(*tki);
++}
++
++static void
++cleanup_buffer(char **buffer)
++{
++    if (!buffer || !*buffer) {
++        return;
++    }
++    free(*buffer);
++}
++
++static void
++cleanup_jose_io_t(jose_io_t ***iosp)
++{
++    jose_io_t **ios = *iosp;
++    for (size_t i = 0; ios && ios[i]; i++) {
++        jose_io_auto(&ios[i]);
++    }
++}
++
++static json_t*
++build_json_array(const char **files, size_t total_files)
++{
++    if (!files || total_files == 0) {
++        return NULL;
++    }
++
++    json_t *arr = json_array();
++    if (!arr) {
++        fprintf(stderr, "Unable to create json array\n");
++        return NULL;
++    }
++
++    for (size_t i = 0; i < total_files; i++) {
++        json_t *jwk = json_load_file(files[i], 0, NULL);
++        if (!jwk) {
++            fprintf(stderr, "Unable to load JSON from %s; skipping\n", files[i]);
++            continue;
++        }
++
++        if (json_array_append_new(arr, jwk) != 0) {
++            fprintf(stderr, "Unable to append JSON %s to array; skipping\n", files[i]);
++            continue;
++        }
++    }
++    return arr;
++}
++
++static json_t*
++remove_private_keys(const struct file_list *fl)
++{
++    if (!fl) {
++        fprintf(stderr, "Invalid file list for cleaning private keys.\n");
++        return NULL;
++    }
++
++    json_auto_t *array = build_json_array((const char**)fl->m_files, fl->m_size);
++    if (!array || json_array_size(array) == 0) {
++        fprintf(stderr, "Empty array %p.\n", array);
++        return NULL;
++    }
++
++    for (size_t i = 0, size = json_array_size(array); i < size; i++) {
++        if (!jose_jwk_pub(NULL, json_array_get(array, i))) {
++            fprintf(stderr, "Error removing private keys.\n");
++            return NULL;
++        }
++    }
++
++    return json_pack("{s:O}", "keys", array);
++}
++
++static json_t*
++prepare_template_sigs(size_t total)
++{
++    json_t *arr = json_array();
++    if (!arr) {
++        fprintf(stderr, "Unable to create JSON sigs array\n");
++        return NULL;
++    }
++
++    for (size_t i = 0; i < total; i++) {
++        json_t *cty = json_pack("{s:{s:s}}", "protected", "cty", "jwk-set+json");
++        if (!cty) {
++            fprintf(stderr, "Unable to create item %zu/%zu; skipping\n", i, total);
++            continue;
++        }
++
++        if (json_array_append_new(arr, cty) != 0) {
++            fprintf(stderr, "Unable to append item %zu/%zu to array; skipping\n", i, total);
++            continue;
++        }
++    }
++    return arr;
++}
++
++static jose_io_t*
++tang_prep_io(jose_io_t *io, uint8_t *buffer, size_t *buflen)
++{
++    if (!io || !buffer || !buflen) {
++        fprintf(stderr, "Either io (%p) the buffer (%p) or the buffer len (%p) are NULL\n", io, buffer, buflen);
++    }
++
++    jose_io_t **ios __attribute__((cleanup(cleanup_jose_io_t))) = NULL;
++    size_t i = 0;
++
++    ios = alloca(sizeof(*ios) * 3);
++    memset(ios, 0, sizeof(*ios) * 3);
++
++    if (io) {
++        ios[i++] = io;
++    }
++
++    ios[i] = jose_io_buffer(NULL, buffer, buflen);
++    if (!ios[i]) {
++            return NULL;
++    }
++
++    for (i = 0; ios[i]; i++) {
++        jose_io_auto_t *b64 = NULL;
++
++        b64 = jose_b64_enc_io(ios[i]);
++        if (!b64) {
++            return NULL;
++        }
++
++        jose_io_decref(ios[i]);
++        ios[i] = jose_io_incref(b64);
++    }
++
++    return jose_io_multiplex(NULL, ios, true);
++}
++
++static int
++prepare_deriving_jwk(struct tang_keys_info *tki, const struct file_list *fl)
++{
++    const size_t hash_alg_count = hash_alg_size();
++    for (size_t a = 0; a < hash_alg_count; a++) {
++        for (size_t i = 0; i < fl->m_size; i++) {
++            struct tang_jwk *jwk __attribute__((cleanup(cleanup_tang_jwk))) = new_tang_jwk(fl->m_files[i], hash_alg[a]);
++            if (!jwk) {
++                fprintf(stderr, "Unable to create tang_jwk from %s with alg %s; skipping.\n", fl->m_files[i], hash_alg[a]);
++                continue;
++            }
++            if (!tang_jwk_list_add(tki->m_derive, jwk)) {
++                fprintf(stderr, "Unable to add JWK from %s with alg %s to list of deriving keys; skipping.\n", fl->m_files[i], hash_alg[a]);
++                continue;
++            }
++        }
++    }
++
++    if (tki->m_derive->m_size > 1) {
++        qsort(tki->m_derive->m_jwk, tki->m_derive->m_size, sizeof(struct tang_jwk*), tang_jwk_thp_cmp_func);
++    }
++    return 1;
++}
++
++static int
++prepare_adv_jwk(struct tang_keys_info *tki, const struct file_list *fl)
++{
++    const size_t hash_alg_count = hash_alg_size();
++    json_auto_t *keys = build_json_array((const char**)tki->m_sign_keys->m_files, tki->m_sign_keys->m_size);
++    json_auto_t *pub = remove_private_keys(tki->m_payload_keys);
++
++    /*
++     * Adding dummy element in the first position. We will be be replacing
++     * it with the actual ones and then creating the JWS data.
++     */
++    json_auto_t *dummy = json_object();
++    if (json_array_insert(keys, 0, dummy) != 0) {
++        fprintf(stderr, "Error preparing adv JWKs.\n");
++        return 0;
++    }
++
++    json_auto_t *sigs = prepare_template_sigs(json_array_size(keys));
++
++    for (size_t i = 0; i < fl->m_size; i++) {
++        json_auto_t *jwk = json_load_file(fl->m_files[i], 0, NULL);
++        if (!jwk) {
++            fprintf(stderr, "Unable to load JWK from %s; skipping.\n", fl->m_files[i]);
++            continue;
++        }
++        if (json_array_set(keys, 0, jwk) != 0) {
++            fprintf(stderr, "Unable to add JWK from file (%s) to array; skipping.\n", fl->m_files[i]);
++            continue;
++        }
++
++        char *jws_data __attribute__((cleanup(cleanup_buffer))) = process_adv(keys, sigs, pub);
++        if (!jws_data) {
++            fprintf(stderr, "Unable to obtain JWS from %s; skipping.\n", fl->m_files[i]);
++            continue;
++        }
++        json_auto_t *jws_json = json_loads(jws_data, 0, NULL);
++        if (!jws_json) {
++            fprintf(stderr, "Unable to convert string to JSON; skipping.\n");
++            continue;
++        }
++        for (size_t a = 0; a < hash_alg_count; a++) {
++            char *thp __attribute__((cleanup(cleanup_buffer))) = jwk_thumbprint(jwk, hash_alg[a]);
++            if (!thp) {
++                fprintf(stderr, "Unable to obtain thumbprint from file (%s) and alg (%s); skipping.\n", fl->m_files[i], hash_alg[a]);
++                continue;
++            }
++            struct tang_jwk *jws __attribute__((cleanup(cleanup_tang_jwk)))= new_tang_jwk_from_args(jws_json, thp, hash_alg[a]);
++            if (!jws) {
++                fprintf(stderr, "Error creating tang_jwk with JWS data from file (%s) and alg (%s); skipping.\n", fl->m_files[i], hash_alg[a]);
++                continue;
++            }
++            if (!tang_jwk_list_add(tki->m_adv, jws)) {
++                fprintf(stderr, "Error adding JWS data from file (%s) and alg (%s) to adv list; skipping.\n", fl->m_files[i], hash_alg[a]);
++                continue;
++            }
++        }
++    }
++
++    if (tki->m_adv->m_size > 1) {
++        qsort(tki->m_adv->m_jwk, tki->m_adv->m_size, sizeof(struct tang_jwk*), tang_jwk_thp_cmp_func);
++    }
++    return 1;
++}
++
++static int
++prepare_deriving_and_adv(struct tang_keys_info *tki)
++{
++    if (!tki) {
++        return 0;
++    }
++
++    struct file_list *fl __attribute__ ((__cleanup__(cleanup_file_list))) = list_files(tki->m_jwkdir, ".jwk", 0 /* ignore hidden */);
++    if (!fl || fl->m_size == 0) {
++        fprintf(stderr, "No JWK keys available.\n");
++        return 0;
++    }
++
++    struct file_list *derive_key __attribute__((__cleanup__(cleanup_file_list))) = new_file_list();
++    struct file_list *jws __attribute__((__cleanup__(cleanup_file_list))) = new_file_list();
++
++    char filepath[PATH_MAX] = {};
++    for (size_t i = 0, size = fl->m_size; i < size; i++) {
++        snprintf(filepath, sizeof(filepath), "%s/%s", tki->m_jwkdir, fl->m_files[i]);
++        filepath[sizeof(filepath) - 1] = '\0';
++        if (valid_for_deriving_keys(filepath)) {
++            if (!file_list_add(derive_key, filepath)) {
++                fprintf(stderr, "Error adding %s to file list of keys valid for deriving keys; skipping.\n", filepath);
++            }
++        } else if (valid_for_signing(filepath)) {
++            if (!file_list_add(jws, filepath)) {
++                fprintf(stderr, "Error adding %s to file list of keys valid for signing; skipping.\n", filepath);
++            }
++        }
++    }
++
++    if (derive_key->m_size == 0 || jws->m_size == 0) {
++        fprintf(stderr, "Either the number of keys able to derive keys (%zu) or to sign keys (%zu) is zero.\n", derive_key->m_size, jws->m_size);
++        return 0;
++    }
++
++    if (!prepare_deriving_jwk(tki, derive_key)) {
++        fprintf(stderr, "Error preparing deriving keys JWK.\n");
++        return 0;
++    }
++
++    if (!prepare_adv_jwk(tki, jws)) {
++        fprintf(stderr, "Error preparing advertising JWK.\n");
++        return 0;
++    }
++
++    return 1;
++}
++
++struct tang_jwk*
++find_adv(const struct tang_keys_info *tki, const char* thp)
++{
++    if (!tki) {
++        fprintf(stderr, "Invalid tang_keys_info (%p).\n", tki);
++        return NULL;
++    }
++    return tang_jwk_list_find_thp(tki->m_adv, thp);
++}
++
++struct tang_jwk*
++find_deriving_key(const struct tang_keys_info *tki, const char* thp)
++{
++    if (!tki) {
++        fprintf(stderr, "Invalid tang_keys_info (%p).\n", tki);
++        return NULL;
++    }
++    return tang_jwk_list_find_thp(tki->m_derive, thp);
++}
++
++struct tang_keys_info*
++read_keys(const char *jwkdir)
++{
++    struct tang_keys_info *tki = new_tang_keys_info(jwkdir);
++    if (!tki) {
++        fprintf(stderr, "Unable to create tang_keys_info\n");
++        return NULL;
++    }
++
++    struct file_list *fl __attribute__ ((__cleanup__(cleanup_file_list))) = list_files(jwkdir, ".jwk", 1 /* ignore hidden */);
++    if (!fl || fl->m_size == 0) {
++        fprintf(stderr, "No JWK keys available.\n");
++        free_tang_keys_info(tki);
++        return NULL;
++    }
++
++    char filepath[PATH_MAX] = {};
++    for (size_t i = 0, size = fl->m_size; i < size; i++) {
++        snprintf(filepath, sizeof(filepath), "%s/%s", jwkdir, fl->m_files[i]);
++        filepath[sizeof(filepath) - 1] = '\0';
++        if (valid_for_signing_and_verifying(filepath)) {
++            if (!file_list_add(tki->m_sign_keys, filepath)) {
++                fprintf(stderr, "Error adding %s to the list of signing keys\n", filepath);
++                free_tang_keys_info(tki);
++                return NULL;
++            }
++            if (!file_list_add(tki->m_payload_keys, filepath)) {
++                fprintf(stderr, "Error adding %s to the list of payload keys\n", filepath);
++                free_tang_keys_info(tki);
++                return NULL;
++            }
++        } else if (valid_for_deriving_keys(filepath)) {
++            if (!file_list_add(tki->m_payload_keys, filepath)) {
++                fprintf(stderr, "Error adding %s to the list of payload keys\n", filepath);
++                free_tang_keys_info(tki);
++                return NULL;
++            }
++        }
++    }
++
++    if (!prepare_deriving_and_adv(tki)) {
++        fprintf(stderr, "Unable to prepare deriving and advcertising JWKs.\n");
++        free_tang_keys_info(tki);
++        return NULL;
++    }
++
++    if (!prepare_default_adv(tki)) {
++        fprintf(stderr, "Unable to prepare the default adv.\n");
++        free_tang_keys_info(tki);
++        return NULL;
++    }
++
++    return tki;
++}
++
++int
++process_payload(const json_t *jwk, jose_io_t *io)
++{
++    char *payload __attribute__((__cleanup__(cleanup_buffer))) = json_dumps(jwk, JSON_SORT_KEYS | JSON_COMPACT);
++    if (!payload) {
++        fprintf(stderr, "Error converting JSON to char*.\n");
++        return 0;
++    }
++
++    for (size_t i = 0, size = strlen(payload); i < size; i++) {
++        uint8_t b = payload[i];
++        if (!io->feed(io, &b, sizeof(b))) {
++            fprintf(stderr, "Error calling io-feed with b = [%c].\n", b);
++            return 0;
++        }
++    }
++
++    if (!io->done(io)) {
++        fprintf(stderr, "Error calling io-done.\n");
++        return 0;
++    }
++    return 1;
++}
++
++char*
++process_adv(const json_t *keys, json_t* sigs, const json_t *pub)
++{
++    /* For the IO data, we need to have an own buffer. */
++    uint8_t buffer[TANG_MAXBUFLEN] = {};
++    size_t buflen = sizeof(buffer);
++    json_auto_t *io_data = json_object();
++
++    jose_io_auto_t *io = jose_jws_sig_io(NULL, io_data, sigs, keys);
++    if (!io) {
++        fprintf(stderr, "jose_jws_sig_io() failed.\n");
++        return NULL;
++    }
++
++    io = tang_prep_io(io, buffer, &buflen);
++    if (!io) {
++        fprintf(stderr, "tang_prep_io() failed.\n");
++        return NULL;
++    }
++
++    if (!process_payload(pub, io)) {
++        fprintf(stderr, "Error processing payload.\n");
++        return NULL;
++    }
++
++    const char *preamble = "{\"payload\":\"";
++    const char *separator = "\",";
++    const char *postamble = "}";
++    char *data __attribute__ ((__cleanup__(cleanup_buffer))) = json_dumps(io_data, JSON_EMBED | JSON_COMPACT | JSON_SORT_KEYS);
++    if (!data) {
++        fprintf(stderr, "Error obtaining signing data.\n");
++        return NULL;
++    }
++
++    size_t adv_len = strlen(preamble) + buflen + strlen(separator) + strlen(data) + strlen(postamble) + 1;
++    char *adv_data = malloc(adv_len);
++    snprintf(adv_data, adv_len, "%s%s%s%s%s", preamble, buffer, separator, data, postamble);
++    adv_data[adv_len - 1] = '\0';
++    return adv_data;
++}
++
++int
++prepare_default_adv(struct tang_keys_info *tki)
++{
++    if (!tki) {
++        fprintf(stderr, "Invalid tang_keys_info\n");
++        return 0;
++    }
++
++    if (!tki->m_sign_keys || tki->m_sign_keys->m_size == 0) {
++        fprintf(stderr, "No valid signing keys.\n");
++        return 0;
++    }
++
++    if (!tki->m_payload_keys || tki->m_payload_keys->m_size <= tki->m_sign_keys->m_size) {
++        fprintf(stderr, "Invalid payload keys.\n");
++        return 0;
++    }
++
++    json_auto_t *keys = build_json_array((const char**)tki->m_sign_keys->m_files, tki->m_sign_keys->m_size);
++    json_auto_t *sigs = prepare_template_sigs(tki->m_sign_keys->m_size);
++    json_auto_t *pub = remove_private_keys(tki->m_payload_keys);
++
++    char *adv_str __attribute__((cleanup(cleanup_buffer))) = process_adv(keys, sigs, pub);
++    if (!adv_str) {
++        return 0;
++    }
++    json_auto_t *json = json_loads(adv_str, 0, NULL);
++    if (!json) {
++        return 0;
++    }
++
++    struct tang_jwk *jwk = new_tang_jwk_from_args(json, NULL, NULL);
++    if (!jwk) {
++        return 0;
++    }
++    tki->m_default_adv = jwk;
++    return 1;
++}
+diff --git a/src/keys.h b/src/keys.h
+new file mode 100644
+index 0000000..150b881
+--- /dev/null
++++ b/src/keys.h
+@@ -0,0 +1,84 @@
++/* vim: set tabstop=8 shiftwidth=4 softtabstop=4 expandtab smarttab colorcolumn=80: */
++/*
++ * Copyright (c) 2019 Red Hat, Inc.
++ * Author: Sergio Correia <scorreia@redhat.com>
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#pragma once
++
++#include <jansson.h>
++#include <jose/io.h>
++
++struct tang_jwk {
++    json_t* m_json;
++    char* m_from_file;
++    char* m_str;
++    char* m_thp;
++    char* m_alg;
++};
++
++struct tang_jwk_list {
++    struct tang_jwk **m_jwk;
++    size_t m_size;
++};
++
++struct tang_keys_info {
++    char *m_jwkdir;
++    struct file_list *m_payload_keys;
++    struct file_list *m_sign_keys;
++
++    struct tang_jwk_list *m_derive;
++    struct tang_jwk_list *m_adv;
++    struct tang_jwk *m_default_adv;
++};
++
++/* struct tang_jwk. */
++struct tang_jwk *new_tang_jwk(const char* /* file */, const char* /* alg */);
++struct tang_jwk* new_tang_jwk_from_args(json_t*, const char* /* thp */, const char* /* alg */);
++struct tang_jwk* tang_jwk_dup(const struct tang_jwk*);
++struct tang_jwk *generate_new_tang_jwk(const char* /* alg */);
++void free_tang_jwk(struct tang_jwk*);
++void cleanup_tang_jwk(struct tang_jwk **jwk);
++
++/* struct tang_jwk_list. */
++struct tang_jwk_list* new_tang_jwk_list(void);
++void free_tang_jwk_list(struct tang_jwk_list*);
++int tang_jwk_list_add(struct tang_jwk_list*, struct tang_jwk*);
++struct tang_jwk* tang_jwk_list_find_thp(const struct tang_jwk_list*, const char*);
++
++char *jwk_thumbprint(const json_t* /* jwk */, const char* /* alg */);
++char *jwk_thumbprint_from_file(const char* /* file */, const char* /* alg */);
++int valid_for_signing(const char* /* file */);
++int valid_for_signing_and_verifying(const char* /* file */);
++int valid_for_deriving_keys(const char* /* file */);
++
++struct tang_keys_info* new_tang_keys_info(const char*);
++void free_tang_keys_info(struct tang_keys_info*);
++void cleanup_tang_keys_info(struct tang_keys_info**);
++
++
++struct tang_keys_info* read_keys(const char*);
++
++int process_payload(const json_t*, jose_io_t*);
++char* process_adv(const json_t*, json_t*, const json_t*);
++int prepare_default_adv(struct tang_keys_info*);
++
++size_t hash_alg_size(void);
++int check_keys(const char*);
++struct tang_jwk* find_adv(const struct tang_keys_info*, const char*);
++struct tang_jwk* find_deriving_key(const struct tang_keys_info*, const char*);
++int is_hash(const char*);
++
+diff --git a/src/tangd-update b/src/tangd-update
+deleted file mode 100755
+index 652dbef..0000000
+--- a/src/tangd-update
++++ /dev/null
+@@ -1,83 +0,0 @@
+-#!/bin/bash
+-# vim: set tabstop=8 shiftwidth=4 softtabstop=4 expandtab smarttab colorcolumn=80:
+-#
+-# Copyright (c) 2016 Red Hat, Inc.
+-# Author: Nathaniel McCallum <npmccallum@redhat.com>
+-#
+-# This program is free software: you can redistribute it and/or modify
+-# it under the terms of the GNU General Public License as published by
+-# the Free Software Foundation, either version 3 of the License, or
+-# (at your option) any later version.
+-#
+-# This program is distributed in the hope that it will be useful,
+-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-# GNU General Public License for more details.
+-#
+-# You should have received a copy of the GNU General Public License
+-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-#
+-
+-TMP='{"protected":{"cty":"jwk-set+json"}}'
+-
+-trap 'exit' ERR
+-
+-shopt -s nullglob
+-
+-HASHES=`jose alg -k hash`
+-
+-if [ $# -ne 2 ] || [ ! -d "$1" ]; then
+-    echo "Usage: $0 <jwkdir> <cachedir>" >&2
+-    exit 1
+-fi
+-
+-[ ! -d "$2" ] && mkdir -p -m 0700 "$2"
+-
+-src=`realpath "$1"`
+-dst=`realpath "$2"`
+-
+-payl=()
+-sign=()
+-
+-for jwk in $src/*.jwk; do
+-    if jose jwk use -i "$jwk" -r -u sign -u verify; then
+-        sign+=("-s" "$TMP" "-k" "$jwk")
+-        payl+=("-i" "$jwk")
+-    elif jose jwk use -i "$jwk" -r -u deriveKey; then
+-        payl+=("-i" "$jwk")
+-    else
+-        echo "Skipping invalid key: $jwk" >&2
+-    fi
+-done
+-
+-if [ ${#sign[@]} -gt 0 ]; then
+-    jose jwk pub -s "${payl[@]}" \
+-        | jose jws sig -I- "${sign[@]}" -o "$dst/.default.jws"
+-    mv -f "$dst/.default.jws" "$dst/default.jws"
+-    new=default.jws
+-fi
+-
+-shopt -s dotglob
+-
+-for jwk in $src/*.jwk; do
+-    for hsh in $HASHES; do
+-        thp=`jose jwk thp -i "$jwk" -a $hsh`
+-
+-        if jose jwk use -i "$jwk" -r -u deriveKey; then
+-            ln -sf "$jwk" "$dst/.$thp.jwk"
+-            mv -f "$dst/.$thp.jwk" "$dst/$thp.jwk"
+-            new="$new\n$thp.jwk"
+-        elif jose jwk use -i "$jwk" -r -u sign; then
+-            keys=("${sign[@]}" -s "$TMP" -k "$jwk")
+-            jose jwk pub -s "${payl[@]}" \
+-                | jose jws sig -I- "${keys[@]}" -o "$dst/.$thp.jws"
+-            mv -f "$dst/.$thp.jws" "$dst/$thp.jws"
+-            new="$new\n$thp.jws"
+-        fi
+-    done
+-done
+-
+-for f in "$dst"/*; do
+-    b=`basename "$f"`
+-    echo -e "$new" | grep -q "^$b\$" || rm -f "$f"
+-done
+diff --git a/src/tangd.c b/src/tangd.c
+index dc45a90..b569f38 100644
+--- a/src/tangd.c
++++ b/src/tangd.c
+@@ -28,6 +28,7 @@
+ #include <unistd.h>
+ 
+ #include <jose/jose.h>
++#include "keys.h"
+ 
+ static void
+ str_cleanup(char **str)
+@@ -50,9 +51,8 @@ adv(enum http_method method, const char *path, const char *body,
+     __attribute__((cleanup(FILE_cleanup))) FILE *file = NULL;
+     __attribute__((cleanup(str_cleanup))) char *adv = NULL;
+     __attribute__((cleanup(str_cleanup))) char *thp = NULL;
+-    char filename[PATH_MAX] = {};
+-    const char *cachedir = misc;
+-    struct stat st = {};
++    __attribute__((cleanup(cleanup_tang_keys_info))) struct tang_keys_info *tki = NULL;
++    const char *jwkdir = misc;
+ 
+     if (matches[1].rm_so < matches[1].rm_eo) {
+         size_t size = matches[1].rm_eo - matches[1].rm_so;
+@@ -61,23 +61,25 @@ adv(enum http_method method, const char *path, const char *body,
+             return http_reply(HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
+     }
+ 
+-    if (snprintf(filename, sizeof(filename),
+-                 "%s/%s.jws", cachedir, thp ? thp : "default") < 0)
+-        return http_reply(HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
+-
+-    file = fopen(filename, "r");
+-    if (!file)
+-        return http_reply(HTTP_STATUS_NOT_FOUND, NULL);
+-
+-    if (fstat(fileno(file), &st) != 0)
++    if (!check_keys(jwkdir)) {
+         return http_reply(HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
++    }
+ 
+-    adv = calloc(st.st_size + 1, 1);
+-    if (!adv)
++    tki = read_keys(jwkdir);
++    if (!tki) {
+         return http_reply(HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
++    }
+ 
+-    if (fread(adv, st.st_size, 1, file) != 1)
+-        return http_reply(HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
++    if (thp) {
++        const struct tang_jwk *jwk = find_adv(tki, thp);
++        if (!jwk) {
++            return http_reply(HTTP_STATUS_NOT_FOUND, NULL);
++        }
++        adv = strdup(jwk->m_str);
++    } else {
++        /* Default adv. */
++        adv = strdup(tki->m_default_adv->m_str);
++    }
+ 
+     return http_reply(HTTP_STATUS_OK,
+                       "Content-Type: application/jose+json\r\n"
+@@ -91,10 +93,11 @@ rec(enum http_method method, const char *path, const char *body,
+ {
+     __attribute__((cleanup(str_cleanup))) char *enc = NULL;
+     __attribute__((cleanup(str_cleanup))) char *thp = NULL;
++    __attribute__((cleanup(cleanup_tang_keys_info))) struct tang_keys_info *tki = NULL;
++    const struct tang_jwk *jwk = NULL;
++
+     size_t size = matches[1].rm_eo - matches[1].rm_so;
+-    char filename[PATH_MAX] = {};
+-    const char *cachedir = misc;
+-    json_auto_t *jwk = NULL;
++    const char *jwkdir = misc;
+     json_auto_t *req = NULL;
+     json_auto_t *rep = NULL;
+     const char *alg = NULL;
+@@ -129,17 +132,24 @@ rec(enum http_method method, const char *path, const char *body,
+     if (!thp)
+         return http_reply(HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
+ 
+-    if (snprintf(filename, sizeof(filename), "%s/%s.jwk", cachedir, thp) < 0)
++    if (!check_keys(jwkdir)) {
++        return http_reply(HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
++    }
++
++    tki = read_keys(jwkdir);
++    if (!tki) {
+         return http_reply(HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
++    }
+ 
+-    jwk = json_load_file(filename, 0, NULL);
+-    if (!jwk)
++    jwk = find_deriving_key(tki, thp);
++    if (!jwk) {
+         return http_reply(HTTP_STATUS_NOT_FOUND, NULL);
++    }
+ 
+-    if (!jose_jwk_prm(NULL, jwk, true, "deriveKey"))
++    if (!jose_jwk_prm(NULL, jwk->m_json, true, "deriveKey"))
+         return http_reply(HTTP_STATUS_FORBIDDEN, NULL);
+ 
+-    if (json_unpack(jwk, "{s:s,s?s}", "d", &d, "alg", &alg) < 0)
++    if (json_unpack(jwk->m_json, "{s:s,s?s}", "d", &d, "alg", &alg) < 0)
+         return http_reply(HTTP_STATUS_FORBIDDEN, NULL);
+ 
+     if (alg && strcmp(alg, "ECMR") != 0)
+@@ -148,7 +158,7 @@ rec(enum http_method method, const char *path, const char *body,
+     /*
+      * Perform the exchange and return
+      */
+-    rep = jose_jwk_exc(NULL, jwk, req);
++    rep = jose_jwk_exc(NULL, jwk->m_json, req);
+     if (!rep)
+         return http_reply(HTTP_STATUS_BAD_REQUEST, NULL);
+ 
+diff --git a/src/util.c b/src/util.c
+new file mode 100644
+index 0000000..b8e3756
+--- /dev/null
++++ b/src/util.c
+@@ -0,0 +1,141 @@
++/* vim: set tabstop=8 shiftwidth=4 softtabstop=4 expandtab smarttab colorcolumn=80: */
++/*
++ * Copyright (c) 2019 Red Hat, Inc.
++ * Author: Sergio Correia <scorreia@redhat.com>
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++
++#include <dirent.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++
++#include "util.h"
++
++struct file_list*
++new_file_list(void)
++{
++    struct file_list *fl = malloc(sizeof(*fl));
++    if (!fl) {
++        return NULL;
++    }
++    fl->m_files = NULL;
++    fl->m_size = 0;
++
++    return fl;
++}
++
++void
++free_file_list(struct file_list *fl)
++{
++    if (!fl) {
++        return;
++    }
++
++    for (size_t i = 0, size = fl->m_size; i < size; i++) {
++        free(fl->m_files[i]);
++    }
++    free(fl->m_files);
++    fl->m_size = 0;
++    free(fl);
++}
++
++void
++cleanup_file_list(struct file_list **fl)
++{
++    if (!fl || !*fl) {
++        return;
++    }
++    free_file_list(*fl);
++}
++
++int
++file_list_add(struct file_list *fl, const char *filepath)
++{
++    if (!fl || !filepath) {
++        return 0;
++    }
++
++    char **new_files = realloc(fl->m_files, sizeof(char *) * (fl->m_size + 1));
++    if (!new_files) {
++        fprintf(stderr, "Error reallocating memory for the new file\n");
++        return 0;
++    }
++
++    fl->m_files = new_files;
++    fl->m_files[fl->m_size++] = strdup(filepath);
++    return 1;
++}
++
++int
++match_file(const char *file, const char *pattern)
++{
++    if (!file) {
++        return 0;
++    }
++
++    if (!pattern) {
++        return 1;
++    }
++
++    return strstr(file, pattern) != NULL;
++}
++
++int
++list_files_cmp_func(const void *a, const void *b)
++{
++    const char *sa = *(const char**)a;
++    const char *sb = *(const char**)b;
++    return strcmp(sa, sb);
++}
++
++struct file_list*
++list_files(const char *path, const char *pattern, int ignore_hidden)
++{
++    struct file_list *fl = new_file_list();
++    struct dirent *d;
++    DIR *dir = opendir(path);
++
++    if (dir == NULL) {
++        return fl;
++    }
++
++    while ((d = readdir(dir)) != NULL) {
++        if (strcmp(d->d_name, ".") == 0 || strcmp(d->d_name, "..") == 0) {
++            continue;
++        }
++
++        if (ignore_hidden && d->d_name[0] == '.') {
++            continue;
++        }
++
++        if (match_file(d->d_name, pattern)) {
++            if (!file_list_add(fl, d->d_name)) {
++                fprintf(stderr, "Unable to add file %s to file list.\n", d->d_name);
++                continue;
++            }
++        }
++    }
++
++    if (fl->m_size > 1) {
++        qsort(fl->m_files, fl->m_size, sizeof(char*), list_files_cmp_func);
++    }
++
++    closedir(dir);
++    return fl;
++}
++
++
+diff --git a/src/util.h b/src/util.h
+new file mode 100644
+index 0000000..c3af014
+--- /dev/null
++++ b/src/util.h
+@@ -0,0 +1,33 @@
++/* vim: set tabstop=8 shiftwidth=4 softtabstop=4 expandtab smarttab colorcolumn=80: */
++/*
++ * Copyright (c) 2019 Red Hat, Inc.
++ * Author: Sergio Correia <scorreia@redhat.com>
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#pragma once
++
++struct file_list {
++    char **m_files;
++    size_t m_size;
++};
++
++struct file_list* new_file_list(void);
++void free_file_list(struct file_list*);
++void cleanup_file_list(struct file_list**);
++int file_list_add(struct file_list* /* fl */, const char* /* filepath */);
++int match_file(const char* /* file */, const char* /* pattern */);
++int list_files_cmp_func(const void*, const void*);
++struct file_list* list_files(const char* /* path */, const char* /* match */, int /* ignore_hidden */);
+diff --git a/tests/adv b/tests/adv
+index 357d097..986e632 100755
+--- a/tests/adv
++++ b/tests/adv
+@@ -36,15 +36,13 @@ trap 'exit' ERR
+ 
+ export TMP=`mktemp -d`
+ mkdir -p $TMP/db
+-mkdir -p $TMP/cache
+ 
+ tangd-keygen $TMP/db sig exc
+ jose jwk gen -i '{"alg": "ES512"}' -o $TMP/db/.sig.jwk
+ jose jwk gen -i '{"alg": "ES512"}' -o $TMP/db/.oth.jwk
+-tangd-update $TMP/db $TMP/cache
+ 
+ export PORT=`shuf -i 1024-65536 -n 1`
+-$SD_ACTIVATE -l "127.0.0.1:$PORT" -a $VALGRIND tangd $TMP/cache &
++$SD_ACTIVATE -l "127.0.0.1:$PORT" -a $VALGRIND tangd $TMP/db &
+ export PID=$!
+ sleep 0.5
+ 
+diff --git a/tests/rec b/tests/rec
+index d1dfe97..3316565 100755
+--- a/tests/rec
++++ b/tests/rec
+@@ -28,11 +28,9 @@ trap 'exit' ERR
+ 
+ export TMP=`mktemp -d`
+ mkdir -p $TMP/db
+-mkdir -p $TMP/cache
+ 
+ # Generate the server keys
+ tangd-keygen $TMP/db sig exc
+-tangd-update $TMP/db $TMP/cache
+ 
+ # Generate the client keys
+ exc_kid=`jose jwk thp -i $TMP/db/exc.jwk`
+@@ -42,7 +40,7 @@ jose jwk pub -i $TMP/exc.jwk -o $TMP/exc.pub.jwk
+ 
+ # Start the server
+ port=`shuf -i 1024-65536 -n 1`
+-$SD_ACTIVATE -l 127.0.0.1:$port -a $VALGRIND tangd $TMP/cache &
++$SD_ACTIVATE -l 127.0.0.1:$port -a $VALGRIND tangd $TMP/db &
+ export PID=$!
+ sleep 0.5
+ 
+diff --git a/units/tangd-keygen.service.in b/units/tangd-keygen.service.in
+deleted file mode 100644
+index 2f80cd8..0000000
+--- a/units/tangd-keygen.service.in
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[Unit]
+-Description=Tang Server key generation script
+-ConditionDirectoryNotEmpty=|!@jwkdir@
+-Requires=tangd-update.path
+-
+-[Service]
+-Type=oneshot
+-ExecStart=@libexecdir@/tangd-keygen @jwkdir@
+diff --git a/units/tangd-update.path.in b/units/tangd-update.path.in
+deleted file mode 100644
+index ee9005d..0000000
+--- a/units/tangd-update.path.in
++++ /dev/null
+@@ -1,4 +0,0 @@
+-[Path]
+-PathChanged=@jwkdir@
+-MakeDirectory=true
+-DirectoryMode=0700
+diff --git a/units/tangd-update.service.in b/units/tangd-update.service.in
+deleted file mode 100644
+index 11a4cb2..0000000
+--- a/units/tangd-update.service.in
++++ /dev/null
+@@ -1,6 +0,0 @@
+-[Unit]
+-Description=Tang Server key update script
+-
+-[Service]
+-Type=oneshot
+-ExecStart=@libexecdir@/tangd-update @jwkdir@ @cachedir@
+diff --git a/units/tangd.socket.in b/units/tangd.socket.in
+index 22474ea..0a3e239 100644
+--- a/units/tangd.socket.in
++++ b/units/tangd.socket.in
+@@ -1,10 +1,5 @@
+ [Unit]
+ Description=Tang Server socket
+-Requires=tangd-keygen.service
+-Requires=tangd-update.service
+-Requires=tangd-update.path
+-After=tangd-keygen.service
+-After=tangd-update.service
+ 
+ [Socket]
+ ListenStream=80
+diff --git a/units/tangd@.service.in b/units/tangd@.service.in
+index c4b9597..f1db261 100644
+--- a/units/tangd@.service.in
++++ b/units/tangd@.service.in
+@@ -5,4 +5,4 @@ Description=Tang Server
+ StandardInput=socket
+ StandardOutput=socket
+ StandardError=journal
+-ExecStart=@libexecdir@/tangd @cachedir@
++ExecStart=@libexecdir@/tangd @jwkdir@
+-- 
+2.18.1
+

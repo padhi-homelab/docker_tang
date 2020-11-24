@@ -23,11 +23,18 @@ RUN git clone https://github.com/latchset/jose.git \
  && mkdir build \
  && cd build \
  && meson .. --prefix=/usr/local \
- && ninja install
+ && ninja install \
+ && mkdir /patches
+
+COPY 0001-Move-key-generation-to-tang.patch /patches/
+COPY 0002-fix-build-issues-after-RHEL-8-patch.patch /patches/
 
 RUN git clone https://github.com/latchset/tang.git \
  && cd tang \
  && git checkout ${TANG_COMMIT_SHA} \
+ && git apply --exclude=Makefile.am \
+              --exclude=units/* \
+              /patches/*.patch \
  && mkdir build \
  && cd build \
  && meson .. --prefix=/usr/local \
@@ -55,19 +62,12 @@ COPY --from=builder \
 COPY --from=builder \
      /usr/local/libexec/tangd-keygen \
      /usr/local/bin/tangd-keygen
-COPY --from=builder \
-     /usr/local/libexec/tangd-update \
-     /usr/local/bin/tangd-update
-
-COPY init-tangd.sh \
-     /usr/local/bin/init-tangd
 
 COPY setup-volume.sh \
      /etc/docker-entrypoint.d/setup-volume.sh
 
 
-RUN chmod +x /usr/local/bin/init-tangd \
-             /etc/docker-entrypoint.d/setup-volume.sh \
+RUN chmod +x /etc/docker-entrypoint.d/setup-volume.sh \
  && apk add --no-cache --update \
         bash \
         http-parser \
@@ -78,10 +78,10 @@ RUN chmod +x /usr/local/bin/init-tangd \
 
 
 EXPOSE 8080
-VOLUME [ "/data/db" ]
+VOLUME [ "/db" ]
 
 
-CMD [ "init-tangd" ]
+CMD [ "socat", "tcp-l:8080,reuseaddr,fork", "exec:'tangd /db'" ]
 
 
 HEALTHCHECK --start-period=5s --interval=30s --timeout=5s --retries=3 \

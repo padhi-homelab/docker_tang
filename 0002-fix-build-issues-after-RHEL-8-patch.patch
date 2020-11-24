@@ -1,0 +1,47 @@
+From 532175d162f3fd21314a19cd0bd9e2960df9d375 Mon Sep 17 00:00:00 2001
+From: Saswat Padhi <saswat.sourav@gmail.com>
+Date: Tue, 24 Nov 2020 02:21:36 -0500
+Subject: [PATCH] fix build issues after RHEL-8 patch
+
+---
+ src/keys.c      | 1 +
+ src/meson.build | 4 +++-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/keys.c b/src/keys.c
+index 77f5d3c..6be6f59 100644
+--- a/src/keys.c
++++ b/src/keys.c
+@@ -23,6 +23,7 @@
+ #include <jose/io.h>
+ #include <jansson.h>
+ #include <string.h>
++#include <alloca.h>
+ 
+ #include "util.h"
+ #include "keys.h"
+diff --git a/src/meson.build b/src/meson.build
+index 1eb8baf..db76ffc 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -1,7 +1,10 @@
+ tangd = executable('tangd',
+   'http.h',
+   'http.c',
++  'keys.h',
++  'keys.c',
+   'tangd.c',
++  'util.c',
+   dependencies: [jose, http_parser],
+   install: true,
+   install_dir: libexecdir
+@@ -9,6 +12,5 @@ tangd = executable('tangd',
+ 
+ bins += join_paths(meson.current_source_dir(), 'tang-show-keys')
+ libexecbins += join_paths(meson.current_source_dir(), 'tangd-keygen')
+-libexecbins += join_paths(meson.current_source_dir(), 'tangd-update')
+ 
+ # vim:set ts=2 sw=2 et:
+-- 
+2.20.1
+

@@ -9,6 +9,17 @@ A multiarch [tang] Docker image, based on [Alpine Linux].
 | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: |
 
 
+## Usage
+
+```
+docker run --rm --detach \
+           -p 8080:8080 \
+           -it padhihomelab/tang
+```
+
+Runs `tang` server on port 8080.
+
+_<More details to be added soon>_
 
 
 [Alpine Linux]: https://alpinelinux.org/
