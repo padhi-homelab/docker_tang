@@ -2,7 +2,7 @@ FROM alpine:3.12 AS builder
 
 
 ARG JOSE_COMMIT_SHA=54bdd6dcce839e6177f732d3d2c07854d988f860
-ARG TANG_COMMIT_SHA=2ef4acf9d4f2113c6b1789b64a7357af667a3efe
+ARG TANG_COMMIT_SHA=711945460398ea7875f74b10da833697679e45ba
 
 
 RUN apk add --no-cache --update \
@@ -26,15 +26,9 @@ RUN git clone https://github.com/latchset/jose.git \
  && ninja install \
  && mkdir /patches
 
-COPY 0001-Move-key-generation-to-tang.patch /patches/
-COPY 0002-fix-build-issues-after-RHEL-8-patch.patch /patches/
-
 RUN git clone https://github.com/latchset/tang.git \
  && cd tang \
  && git checkout ${TANG_COMMIT_SHA} \
- && git apply --exclude=Makefile.am \
-              --exclude=units/* \
-              /patches/*.patch \
  && mkdir build \
  && cd build \
  && meson .. --prefix=/usr/local \
