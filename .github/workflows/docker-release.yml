@@ -35,7 +35,7 @@ jobs:
           REPONAME=$(basename $GITHUB_REPOSITORY)
           DOCKER_IMAGE=padhihomelab/${REPONAME#docker_}
 
-          VERSION=edge
+          VERSION=testing
           if [[ $GITHUB_REF == refs/tags/* ]]; then
             VERSION=${GITHUB_REF#refs/tags/v}
             VERSION=${VERSION#_}
