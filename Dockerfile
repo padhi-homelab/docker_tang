@@ -1,4 +1,4 @@
-FROM alpine:3.13 AS builder
+FROM alpine:3.14.0 AS builder
 
 
 ARG JOSE_COMMIT_SHA=145c41a4ec70c15f6f8aa12a915e16cb60f0991f
