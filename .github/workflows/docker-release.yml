@@ -76,7 +76,7 @@ jobs:
         with:
           image: "${{ steps.prepare.outputs.image }}:${{ steps.prepare.outputs.version }}"
           acs-report-enable: true
-          fail-build: true
+          fail-build: false
           severity-cutoff: "critical"
       -
         name: "Anchore Scan: Report"
