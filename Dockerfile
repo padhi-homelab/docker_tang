@@ -1,8 +1,8 @@
-FROM alpine:3.14 AS builder
+FROM alpine:3.15 AS builder
 
 
-ARG JOSE_COMMIT_SHA=145c41a4ec70c15f6f8aa12a915e16cb60f0991f
-ARG TANG_COMMIT_SHA=8affe3580c97280a8da31514d47c4ac4981992ec
+ARG JOSE_COMMIT_SHA=76924deb30647730230f26ac6f2d2c0afe3b6d0c
+ARG TANG_COMMIT_SHA=e2059ee1109510a7c14b099af7dcd8631e598270
 
 
 RUN apk add --no-cache --update \
@@ -37,7 +37,7 @@ RUN git clone https://github.com/latchset/tang.git \
 
 
 
-FROM padhihomelab/alpine-base:3.14.0_0.19.0_0.2
+FROM padhihomelab/alpine-base:3.15.0_0.19.0_0.2
 
 
 COPY --from=builder \
@@ -57,13 +57,12 @@ COPY --from=builder \
      /usr/local/libexec/tangd-keygen \
      /usr/local/bin/tangd-keygen
 
-COPY setup-volume.sh \
-     /etc/docker-entrypoint.d/setup-volume.sh
+COPY entrypoint-scripts \
+     /etc/docker-entrypoint.d/99-extra-scripts
 
 
-RUN chmod +x /etc/docker-entrypoint.d/setup-volume.sh \
+RUN chmod +x /etc/docker-entrypoint.d/99-extra-scripts/*.sh \
  && apk add --no-cache --update \
-        bash \
         http-parser \
         jansson \
         openssl \
