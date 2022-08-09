@@ -74,7 +74,7 @@ EXPOSE 8080
 VOLUME [ "/db" ]
 
 
-CMD [ "socat", "tcp-l:8080,reuseaddr,fork", "exec:'tangd /db'" ]
+CMD [ "socat", "tcp-l:8080,reuseaddr,fork", "system:'REMOTE_ADDR=$SOCAT_PEERADDR tangd /db'" ]
 
 
 HEALTHCHECK --start-period=5s --interval=30s --timeout=5s --retries=3 \
