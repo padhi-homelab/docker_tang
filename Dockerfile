@@ -23,8 +23,7 @@ RUN git clone https://github.com/latchset/jose.git \
  && mkdir build \
  && cd build \
  && meson .. --prefix=/usr/local \
- && ninja install \
- && mkdir /patches
+ && ninja install
 
 RUN git clone https://github.com/latchset/tang.git \
  && cd tang \
@@ -37,7 +36,7 @@ RUN git clone https://github.com/latchset/tang.git \
 
 
 
-FROM padhihomelab/alpine-base:3.15.0_0.19.0_0.2
+FROM padhihomelab/alpine-base:3.16.1_0.19.0_0.2
 
 
 COPY --from=builder \
