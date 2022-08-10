@@ -77,4 +77,4 @@ CMD [ "socat", "tcp-l:8080,reuseaddr,fork", "system:'REMOTE_ADDR=$SOCAT_PEERADDR
 
 
 HEALTHCHECK --start-period=5s --interval=30s --timeout=5s --retries=3 \
-        CMD ["wget", "--tries", "5", "-qSO", "/dev/null",  "http://localhost:8080/adv"]
+        CMD ["wget", "--tries", "5", "-qSO", "/dev/null",  "http://127.0.0.1:8080/adv"]
