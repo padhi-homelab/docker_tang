@@ -23,6 +23,23 @@ You might also want to use:
 - the `--rm` to cleanup the container filesystem after `docker` exits
 - a `docker compose` workflow instead (see: [services/tang])
 
+## IPv4 vs IPv6
+
+By default, the `tang` server only listens on IPv4.
+You may, however, also listen on IPv6 by creating a container
+with `ENABLE_IPv6=1` set:
+
+```
+docker run -e ENABLE_IPv6=1 ...
+```
+
+You may even disable listening on IPv4 entirely,
+and only listen on IPv6 instead:
+
+```
+docker run -e ENABLE_IPv4=0 -e ENABLE_IPv6=1 ...
+```
+
 ## Persistent Database
 
 To persist tang's database beyond the lifetime of a container,

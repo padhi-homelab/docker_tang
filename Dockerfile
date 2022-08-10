@@ -58,14 +58,21 @@ COPY --from=builder \
 
 COPY entrypoint-scripts \
      /etc/docker-entrypoint.d/99-extra-scripts
+COPY check-servers.sh \
+     /usr/local/bin/check-servers
+COPY start-servers.sh \
+     /usr/local/bin/start-servers
 
 
 RUN chmod +x /etc/docker-entrypoint.d/99-extra-scripts/*.sh \
+             /usr/local/bin/check-servers \
+             /usr/local/bin/start-servers \
  && apk add --no-cache --update \
         http-parser \
         jansson \
         openssl \
         socat \
+        wget \
         zlib
 
 
@@ -73,8 +80,11 @@ EXPOSE 8080
 VOLUME [ "/db" ]
 
 
-CMD [ "socat", "tcp-l:8080,reuseaddr,fork", "system:'REMOTE_ADDR=$SOCAT_PEERADDR tangd /db'" ]
+ENV ENABLE_IPv4=1
+ENV ENABLE_IPv6=0
+
+CMD "start-servers"
 
 
-HEALTHCHECK --start-period=5s --interval=30s --timeout=5s --retries=3 \
-        CMD ["wget", "--tries", "5", "-qSO", "/dev/null",  "http://127.0.0.1:8080/adv"]
+HEALTHCHECK --start-period=5s --timeout=3s \
+        CMD "check-servers"
