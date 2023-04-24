@@ -1,21 +1,21 @@
-FROM alpine:3.17.1 AS builder
+FROM alpine:3.17.3 AS builder
 
 
-ARG JOSE_COMMIT_SHA=3d5b287243f87ce0243b23abd690d86c41fc499c
+ARG JOSE_COMMIT_SHA=e1d66f13308098fc2c6232bbb8238da5d5a468da
 ARG TANG_COMMIT_SHA=7c0d86f5ce6a2b60bd059e87f5235b5c29e5bec9
 
 
 RUN apk add --no-cache --update \
-    bash \
-    g++ gawk git gmp gzip \
-    http-parser-dev \
-    isl-dev \
-    jansson-dev \
-    meson mpc1-dev mpfr-dev musl-dev \
-    ninja \
-    openssl-dev \
-    tar \
-    zlib-dev
+            bash \
+            g++ gawk git gmp gzip \
+            http-parser-dev \
+            isl-dev \
+            jansson-dev \
+            meson mpc1-dev mpfr-dev musl-dev \
+            ninja \
+            openssl-dev \
+            tar \
+            zlib-dev
 
 RUN git clone https://github.com/latchset/jose.git \
  && cd jose \
@@ -36,7 +36,7 @@ RUN git clone https://github.com/latchset/tang.git \
 
 
 
-FROM padhihomelab/alpine-base:3.17.1_0.19.0_0.2
+FROM padhihomelab/alpine-base:3.17.3_0.19.0_0.2
 
 
 COPY --from=builder \
@@ -68,12 +68,12 @@ RUN chmod +x /etc/docker-entrypoint.d/99-extra-scripts/*.sh \
              /usr/local/bin/check-servers \
              /usr/local/bin/start-servers \
  && apk add --no-cache --update \
-        http-parser \
-        jansson \
-        openssl \
-        socat \
-        wget \
-        zlib
+            http-parser \
+            jansson \
+            openssl \
+            socat \
+            wget \
+            zlib
 
 
 EXPOSE 8080
