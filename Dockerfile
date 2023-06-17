@@ -1,8 +1,8 @@
-FROM alpine:3.17.3 AS builder
+FROM alpine:3.18.2 AS builder
 
 
-ARG JOSE_COMMIT_SHA=786b426df018edf30a53e2d82155df20d13047c1
-ARG TANG_COMMIT_SHA=0867603dc8b01945de3e300e48db86d78cb2575d
+ARG JOSE_COMMIT_SHA=55b11f5ba4417737e0677144443e7543d329bc5f
+ARG TANG_COMMIT_SHA=100265e32f56e33c8120fca83de419155ac8db5e
 
 
 RUN apk add --no-cache --update \
@@ -36,7 +36,7 @@ RUN git clone https://github.com/latchset/tang.git \
 
 
 
-FROM padhihomelab/alpine-base:3.17.3_0.19.0_0.2
+FROM padhihomelab/alpine-base:3.18.2_0.19.0_0.2
 
 
 COPY --from=builder \
