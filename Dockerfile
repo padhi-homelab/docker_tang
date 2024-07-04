@@ -1,7 +1,7 @@
-FROM alpine:3.19.1 AS builder
+FROM alpine:3.20.1 AS builder
 
 
-ARG JOSE_COMMIT_SHA=76ec70ba4875a6ab6ad83b295e3da94685bbacb8
+ARG JOSE_COMMIT_SHA=339ad6c836587c3e481f5df56c22c5370c7a264b
 ARG TANG_COMMIT_SHA=02105756ee2a3afbd7065a47664d202788c9b584
 
 
@@ -36,7 +36,7 @@ RUN git clone https://github.com/latchset/tang.git \
 
 
 
-FROM padhihomelab/alpine-base:3.19.1_0.19.0_0.2
+FROM padhihomelab/alpine-base:3.20.1_0.19.0_0.2
 
 
 COPY --from=builder \

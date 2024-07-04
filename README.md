@@ -1,6 +1,6 @@
 # docker_tang
 
-[![build status](https://img.shields.io/github/actions/workflow/status/padhi-homelab/docker_tang/docker-release.yml?label=BUILD&branch=main&logo=github&logoWidth=24&style=flat-square)](https://github.com/padhi-homelab/docker_tang/actions?query=workflow%3A%22Docker+CI+Release%22)
+[![build status](https://img.shields.io/github/actions/workflow/status/padhi-homelab/docker_tang/docker-release.yml?label=BUILD&branch=main&logo=github&logoWidth=24&style=flat-square)](https://github.com/padhi-homelab/docker_tang/actions)
 [![testing size](https://img.shields.io/docker/image-size/padhihomelab/tang/testing?label=SIZE%20%5Btesting%5D&logo=docker&logoColor=skyblue&logoWidth=24&style=flat-square)](https://hub.docker.com/r/padhihomelab/tang/tags)
 [![latest size](https://img.shields.io/docker/image-size/padhihomelab/tang/latest?label=SIZE%20%5Blatest%5D&logo=docker&logoColor=skyblue&logoWidth=24&style=flat-square)](https://hub.docker.com/r/padhihomelab/tang/tags)
   
