@@ -72,7 +72,7 @@ jobs:
       -
         name: "Anchore Scan: Run"
         id: scan
-        uses: anchore/scan-action@v5
+        uses: anchore/scan-action@v6
         with:
           image: "${{ steps.prepare.outputs.image }}:${{ steps.prepare.outputs.version }}"
           acs-report-enable: true
