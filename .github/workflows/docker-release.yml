@@ -55,7 +55,7 @@ jobs:
           echo ::set-output name=version::${VERSION}
       -
         name: "Docker: Buildx Build"
-        uses: docker/build-push-action@v6.10.0
+        uses: docker/build-push-action@v6.11.0
         with:
           platforms: ${{ steps.prepare.outputs.platforms }}
           push: false
@@ -63,7 +63,7 @@ jobs:
           build-args: ${{ steps.prepare.outputs.args }}
       -
         name: "Docker: Load Image"
-        uses: docker/build-push-action@v6.10.0
+        uses: docker/build-push-action@v6.11.0
         with:
           load: true
           push: false
@@ -93,7 +93,7 @@ jobs:
       -
         name: "Docker: Buildx Push"
         if: success() && github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6.10.0
+        uses: docker/build-push-action@v6.11.0
         with:
           platforms: ${{ steps.prepare.outputs.platforms }}
           push: true
