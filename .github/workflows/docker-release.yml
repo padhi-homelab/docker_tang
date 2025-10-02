@@ -111,7 +111,7 @@ jobs:
       -
         name: "Docker Hub: Update description"
         if: success() && github.event_name != 'pull_request'
-        uses: peter-evans/dockerhub-description@v4
+        uses: peter-evans/dockerhub-description@v5
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
           DOCKERHUB_PASSWORD: ${{ secrets.DOCKER_HUB_PASSWORD }}
