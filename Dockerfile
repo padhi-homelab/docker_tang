@@ -36,7 +36,7 @@ RUN git clone https://github.com/latchset/tang.git \
 
 
 
-FROM padhihomelab/alpine-base:3.24.1_0.19.0_0.3
+FROM padhihomelab/alpine-base:3.24.2_0.19.0_0.3
 
 
 COPY --from=builder \
